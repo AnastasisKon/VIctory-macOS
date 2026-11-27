@@ -388,6 +388,17 @@ pub fn in_title_image(address: usize) -> bool {
     })
 }
 
+/// The end of the title image `address` lies in, if any: code at `address`
+/// may be read up to it, and no further (the page past the image's end may
+/// not be mapped).
+pub fn title_image_end(address: usize) -> Option<usize> {
+    images().iter().find_map(|m| {
+        let base = m.image.base();
+        let end = base + m.image.info().size_of_image as usize;
+        (base..end).contains(&address).then_some(end)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

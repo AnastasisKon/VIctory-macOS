@@ -249,18 +249,32 @@ const FATAL: [i32; 6] = [
 /// `rdpru` (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
-/// changes frequency.
+/// changes frequency. `extrq`/`insertq` (SSE4a) are emulated below and
+/// replaced in the title's code at their first exception
+/// ([`crate::amd_only::replace_sse4a`]).
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
     unsafe {
         let record = &*(*info).ExceptionRecord;
         let context = &mut *(*info).ContextRecord;
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::amd_only::Timed(std::time::Instant::now());
+        // An `extrq`/`insertq` site another thread has replaced, or is
+        // replacing (`int3` mid-write): this thread's exception was raised
+        // by the bytes the site had, so emulate those — once — and step
+        // over, whatever the bytes there are now (a jump raises none).
+        if matches!(record.ExceptionCode, EXCEPTION_ILLEGAL_INSTRUCTION | EXCEPTION_BREAKPOINT)
+            && let Some(op) = crate::amd_only::replaced_sse4a(context.Rip as usize)
+        {
+            count(Kind::Replaced);
+            apply_sse4a(&op, &mut context.Anonymous.FltSave.XmmRegisters);
+            context.Rip += op.len as u64;
+            return true;
+        }
         if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
             return false;
         }
-        #[cfg(feature = "diagnostics")]
-        let _timed = crate::amd_only::Timed(std::time::Instant::now());
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => return clzero(context),
@@ -317,10 +331,12 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += len as u64;
                     return true;
                 }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                let Some(len) = sse4a(&bytes[..n], &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
                 count(Kind::Sse4a);
+                // Replaced at its first exception, so the next pass raises none.
+                crate::amd_only::replace_sse4a(context.Rip as usize);
                 context.Rip += len as u64;
                 return true;
             }
@@ -598,57 +614,28 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 }
 const CMP_FLAGS: u32 = 0x8d5;
 
-/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
-        return None;
+/// SSE4a's `extrq`/`insertq` on the saved XMM registers; returns the
+/// instruction's length. Decoded and applied as
+/// [`crate::amd_only::decode_sse4a`]/[`crate::amd_only::sse4a_apply`], so the
+/// handler's emulation and the plain-code stubs that replace the instruction
+/// ([`crate::amd_only::sse4a_stub`]) cannot drift apart.
+fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
+    let op = crate::amd_only::decode_sse4a(code)?;
+    apply_sse4a(&op, xmm);
+    Some(op.len)
+}
+
+/// Applies the decoded `extrq`/`insertq` to the saved XMM registers.
+fn apply_sse4a(op: &crate::amd_only::Sse4aOp, xmm: &mut [M128A; 16]) {
+    let mut pairs = [(0u64, 0u64); 16];
+    for (i, r) in xmm.iter().enumerate() {
+        pairs[i] = (r.Low, r.High as u64);
     }
-    let modrm = b(at + 2);
-    if modrm >> 6 != 3 {
-        return None;
+    crate::amd_only::sse4a_apply(op, &mut pairs);
+    for (i, r) in xmm.iter_mut().enumerate() {
+        r.Low = pairs[i].0;
+        r.High = pairs[i].1 as i64;
     }
-    let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
-    let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
-    let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
-    } else {
-        // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 {
-            xmm[src].Low
-        } else {
-            xmm[src].High as u64
-        };
-        ((f as u8, (f >> 8) as u8), at + 3)
-    };
-    let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
-    let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
-    if prefix == 0x66 {
-        // extrq: register form takes its fields from src, works on dst.
-        if immediate && (modrm >> 3) & 7 != 0 {
-            return None;
-        }
-        let target = if immediate { src } else { dst };
-        xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
-    } else {
-        let value = (xmm[src].Low & mask) << at_bit;
-        xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
-    }
-    Some(len)
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -1971,6 +1958,87 @@ mod tests {
         // SAFETY: bytes of ours; refused before anything is touched.
         assert!(!unsafe { crate::amd_only::replace_wait(here.as_ptr() as usize) });
         assert_eq!(here, [0x0f, 0x01, 0xfa, 0xcc]);
+    }
+
+    /// Gives the code at `rip` to the emulation as if it faulted with
+    /// `exception` there, with `xmm` as the saved registers. Returns the
+    /// number of bytes the emulation skipped, or `None`.
+    fn emulate_at(exception: i32, rip: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
+        // SAFETY: a zeroed record and context are valid; the emulation
+        // reads only the code at `rip` (mapped, as the caller's page) and
+        // writes only `context`.
+        unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = exception;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = rip;
+            context.Anonymous.FltSave.XmmRegisters = *xmm;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            let emulated = emulate_amd_only(&mut pointers);
+            *xmm = context.Anonymous.FltSave.XmmRegisters;
+            emulated.then(|| context.Rip - rip)
+        }
+    }
+
+    /// An `extrq`/`insertq` replaced at its first exception: the first
+    /// exception emulates it and the site becomes a jump to plain code; a
+    /// thread whose exception was raised before the change — an illegal
+    /// instruction or an `int3` mid-write at the site — is emulated from the
+    /// record, once, and stepped over. The four-byte register form is left
+    /// to the handler, and code that is no title's is never changed.
+    #[test]
+    fn an_sse4a_replaced_at_its_first_exception_is_emulated_from_the_record_after() {
+        use crate::amd_only::{TEST_CODE, patches_sse4a, replaced_sse4a};
+        if !patches_sse4a() {
+            return;
+        }
+        // `extrq xmm0, len 8, at 4`, then `int3`.
+        let code: [u8; 7] = [0x66, 0x0f, 0x78, 0xc0, 0x08, 0x04, 0xcc];
+        let page = code_page(4096, &[(0x100, &code)]);
+        TEST_CODE.lock().unwrap().push((page, page + 4096));
+        let at = (page + 0x100) as u64;
+        let first_byte = || {
+            // SAFETY: inside the page.
+            unsafe { (at as *const u8).read_volatile() }
+        };
+        let mut xmm = [reg(0x1122_3344_5566_7788, 0); 16];
+        // The first exception: emulated, and the site replaced.
+        assert_eq!(emulate_at(EXCEPTION_ILLEGAL_INSTRUCTION, at, &mut xmm), Some(6));
+        assert_eq!(xmm[0].Low, 0x1122_3344_5566_7788 >> 4 & 0xff);
+        assert_eq!(replaced_sse4a(at as usize).map(|op| op.len), Some(6));
+        assert_eq!(first_byte(), 0xe9, "the site now jumps to the plain code");
+        // Replacing it again does nothing.
+        // SAFETY: our page, registered as test code.
+        assert!(!unsafe { crate::amd_only::replace_sse4a(at as usize) });
+        // A thread whose exception was raised before the change: emulated
+        // from the record, once, and stepped over — whatever the bytes there
+        // are now.
+        let mut xmm = [reg(0xffff_ffff_ffff_ffff, 0); 16];
+        assert_eq!(emulate_at(EXCEPTION_ILLEGAL_INSTRUCTION, at, &mut xmm), Some(6));
+        assert_eq!(xmm[0].Low, 0xffff_ffff_ffff_ffff >> 4 & 0xff);
+        let mut xmm = [reg(0xffff_ffff_ffff_ffff, 0); 16];
+        assert_eq!(emulate_at(EXCEPTION_BREAKPOINT, at, &mut xmm), Some(6));
+        assert_eq!(xmm[0].Low, 0xffff_ffff_ffff_ffff >> 4 & 0xff);
+        // A breakpoint nowhere recorded is not ours.
+        let mut xmm = [reg(1, 0); 16];
+        assert_eq!(emulate_at(EXCEPTION_BREAKPOINT, (page + 0x200) as u64, &mut xmm), None);
+        // The four-byte register form is too short for the jump: left alone.
+        let code4: [u8; 5] = [0x66, 0x0f, 0x79, 0xc1, 0xcc];
+        let page2 = code_page(4096, &[(0x100, &code4)]);
+        TEST_CODE.lock().unwrap().push((page2, page2 + 4096));
+        // SAFETY: our page, registered as test code.
+        assert!(!unsafe { crate::amd_only::replace_sse4a(page2 + 0x100) });
+        assert!(replaced_sse4a(page2 + 0x100).is_none());
+        // SAFETY: inside the page.
+        assert_eq!(unsafe { ((page2 + 0x100) as *const u8).read_volatile() }, 0x66);
+        // Code that is no title's and no test's is never changed.
+        let scratch = [0x66_u8, 0x0f, 0x78, 0xc0, 0x08, 0x04, 0xcc];
+        // SAFETY: bytes of ours; refused before anything is touched.
+        assert!(!unsafe { crate::amd_only::replace_sse4a(scratch.as_ptr() as usize) });
+        assert_eq!(scratch[0], 0x66);
     }
 
     /// What a `clzero` loop leaves, for the comparison of the handler's

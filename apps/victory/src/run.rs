@@ -116,6 +116,14 @@ pub fn run(
                 "emulated each time (VICTORY_PATCH_WAITS=0)"
             }
         );
+        println!(
+            "extrq/insertq  {}",
+            if victory_loader::patches_sse4a() {
+                "replaced at their first exception (VICTORY_PATCH_SSE4A=0: emulated each time)"
+            } else {
+                "emulated each time (VICTORY_PATCH_SSE4A=0)"
+            }
+        );
     }
     // Masked stores redone as plain stores Rosetta can resume, so fault
     // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).

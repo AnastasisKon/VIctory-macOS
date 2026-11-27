@@ -47,7 +47,7 @@ mod windows;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use amd_only::log_emulated;
 #[cfg(windows)]
-pub use amd_only::{patch_clzero_loops, patches_waits};
+pub use amd_only::{patch_clzero_loops, patches_sse4a, patches_waits};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;
 #[cfg(windows)]
